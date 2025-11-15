@@ -35,7 +35,7 @@ Mhz19 co2Sensor;
 
 Adafruit_BME280 bme;
 
-#define GDK101_ADDRESS 0x42
+#define GDK101_ADDRESS 0x18  // default I2C address
 
 // -------------------- NETWORK ----------------------------
 WiFiClient espClient;
@@ -79,14 +79,11 @@ void connectMQTT() {
 // -------------------- SDS011 READ ------------------------
 bool readSDS011(float &pm25, float &pm10) {
     uint8_t buf[10];
-
     if (sdsSerial.available() >= 10) {
         if (sdsSerial.read() == 0xAA && sdsSerial.peek() == 0xC0) {
             sdsSerial.readBytes(buf, 9);
-
             pm25 = (buf[2] * 256 + buf[1]) / 10.0;
             pm10 = (buf[4] * 256 + buf[3]) / 10.0;
-
             sdsSerial.read(); // drop checksum
             Serial.print("[SDS011] PM2.5: "); Serial.print(pm25);
             Serial.print(" µg/m³, PM10: "); Serial.println(pm10);
@@ -107,24 +104,32 @@ void readBME(float &t, float &h, float &p) {
 }
 
 // -------------------- GDK101 READ ------------------------
-int readGDK101() {
-    int data = -1;
+float readGDK101() {
+    byte buffer[2];
+    float radiation = -1.0;
 
     Wire.beginTransmission(GDK101_ADDRESS);
-    Wire.write(0x01); // Request measurement (example command)
-    Wire.endTransmission();
+    Wire.write(0xB3); // 1-min avg
+    if (Wire.endTransmission() != 0) {
+        Serial.println("[GDK101] Transmission error");
+        return -1;
+    }
 
-    delay(50);
+    delay(10);
 
     Wire.requestFrom(GDK101_ADDRESS, 2);
     if (Wire.available() == 2) {
-        data = Wire.read() << 8 | Wire.read();
-        Serial.print("[GDK101] Radiation: "); Serial.println(data);
+        buffer[0] = Wire.read();
+        buffer[1] = Wire.read();
+        radiation = buffer[0] + buffer[1] / 100.0;
+        Serial.print("[GDK101] Radiation: ");
+        Serial.print(radiation);
+        Serial.println(" uSv/hr");
     } else {
         Serial.println("[GDK101] No data received");
     }
 
-    return data;
+    return radiation;
 }
 
 // -------------------- SETUP -----------------------------
@@ -170,29 +175,22 @@ void loop() {
     float pm25 = 0, pm10 = 0;
     float temperature = 0, humidity = 0, pressure = 0;
     int co2 = -1;
-    int radiation = -1;
+    float radiation = -1.0;
 
     // Read SDS011
     if (readSDS011(pm25, pm10)) {
-        Serial.println("[MQTT] Publishing PM values...");
         mqtt.publish(TOPIC_PM25, String(pm25).c_str(), true);
         mqtt.publish(TOPIC_PM10, String(pm10).c_str(), true);
-    } else {
-        Serial.println("[SDS011] No data read");
     }
 
     // Read CO2
     co2 = co2Sensor.getCarbonDioxide();
     if (co2 > 0) {
-        Serial.print("[CO2] ppm: "); Serial.println(co2);
         mqtt.publish(TOPIC_CO2, String(co2).c_str(), true);
-    } else {
-        Serial.println("[CO2] Failed to read");
     }
 
     // Read BME280
     readBME(temperature, humidity, pressure);
-    Serial.println("[MQTT] Publishing BME280 data...");
     mqtt.publish(TOPIC_TEMP,  String(temperature).c_str(), true);
     mqtt.publish(TOPIC_HUM,   String(humidity).c_str(), true);
     mqtt.publish(TOPIC_PRESS, String(pressure).c_str(), true);
@@ -203,6 +201,5 @@ void loop() {
         mqtt.publish(TOPIC_RAD, String(radiation).c_str(), true);
     }
 
-    Serial.println("[Loop] Waiting 5 seconds before next read...\n");
     delay(5000);
 }
