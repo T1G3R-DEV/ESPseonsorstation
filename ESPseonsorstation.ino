@@ -3,6 +3,7 @@
 #include <SoftwareSerial.h>
 #include <Adafruit_BME280.h>
 #include <Mhz19.h>
+#include <Wire.h>
 
 // --------------------- USER CONFIG ------------------------
 const char* WIFI_SSID = "USR8054";
@@ -23,24 +24,18 @@ const char* TOPIC_PRESS = "home/sensors/pressure";
 // ----------------------------------------------------------
 
 // -------------------- SENSOR PINS ------------------------
-// SDS011 (Serial)
 #define SDS_RX 16
 #define SDS_TX 17
 SoftwareSerial sdsSerial(SDS_RX, SDS_TX);
 
-// MH-Z14A (CO2)
 #define MHZ_RX 4
 #define MHZ_TX 5
 SoftwareSerial co2Serial(MHZ_RX, MHZ_TX);
 Mhz19 co2Sensor;
 
-// GDK101 (Radiation)
-#define GDK_PIN 34
-volatile unsigned long pulseCount = 0;
-void IRAM_ATTR countPulse() { pulseCount++; }
-
-// BME280
 Adafruit_BME280 bme;
+
+#define GDK101_ADDRESS 0x42
 
 // -------------------- NETWORK ----------------------------
 WiFiClient espClient;
@@ -48,16 +43,36 @@ PubSubClient mqtt(espClient);
 
 // -------------------- CONNECT WIFI -----------------------
 void connectWiFi() {
+    Serial.println("[WiFi] Connecting...");
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED) delay(500);
+    int attempt = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        attempt++;
+        if (attempt > 40) { // 20 seconds timeout
+            Serial.println("\n[WiFi] Failed to connect!");
+            return;
+        }
+    }
+    Serial.println("\n[WiFi] Connected!");
+    Serial.print("[WiFi] IP Address: ");
+    Serial.println(WiFi.localIP());
 }
 
 // -------------------- CONNECT MQTT -----------------------
 void connectMQTT() {
+    Serial.println("[MQTT] Connecting...");
     while (!mqtt.connected()) {
-        mqtt.connect("esp32_sensors", MQTT_USER, MQTT_PASS);
-        if (!mqtt.connected()) delay(1500);
+        if (mqtt.connect("esp32_sensors", MQTT_USER, MQTT_PASS)) {
+            Serial.println("[MQTT] Connected!");
+        } else {
+            Serial.print("[MQTT] Failed, rc=");
+            Serial.print(mqtt.state());
+            Serial.println(" Retrying in 1.5s");
+            delay(1500);
+        }
     }
 }
 
@@ -73,91 +88,121 @@ bool readSDS011(float &pm25, float &pm10) {
             pm10 = (buf[4] * 256 + buf[3]) / 10.0;
 
             sdsSerial.read(); // drop checksum
+            Serial.print("[SDS011] PM2.5: "); Serial.print(pm25);
+            Serial.print(" µg/m³, PM10: "); Serial.println(pm10);
             return true;
         }
     }
     return false;
 }
 
-// -------------------- GDK101 READ ------------------------
-float readGDK101() {
-    unsigned long counts = pulseCount;
-    pulseCount = 0;
-    return counts / 6.0; // CPM → μSv/h approx
-}
-
-// -------------------- MH-Z14A READ -----------------------
-int readCO2() {
-    return co2Sensor.getCarbonDioxide(); // official API
-}
-
-// -------------------- BME280 READ -----------------------
+// -------------------- BME280 READ ------------------------
 void readBME(float &t, float &h, float &p) {
     t = bme.readTemperature();
     h = bme.readHumidity();
     p = bme.readPressure() / 100.0F; // hPa
+    Serial.print("[BME280] Temp: "); Serial.print(t);
+    Serial.print(" °C, Hum: "); Serial.print(h);
+    Serial.print(" %, Press: "); Serial.println(p);
+}
+
+// -------------------- GDK101 READ ------------------------
+int readGDK101() {
+    int data = -1;
+
+    Wire.beginTransmission(GDK101_ADDRESS);
+    Wire.write(0x01); // Request measurement (example command)
+    Wire.endTransmission();
+
+    delay(50);
+
+    Wire.requestFrom(GDK101_ADDRESS, 2);
+    if (Wire.available() == 2) {
+        data = Wire.read() << 8 | Wire.read();
+        Serial.print("[GDK101] Radiation: "); Serial.println(data);
+    } else {
+        Serial.println("[GDK101] No data received");
+    }
+
+    return data;
 }
 
 // -------------------- SETUP -----------------------------
 void setup() {
     Serial.begin(115200);
+    Serial.println("[Setup] Starting...");
 
-    // SDS011
     sdsSerial.begin(9600);
+    Serial.println("[Setup] SDS011 initialized");
 
-    // MH-Z14A
     co2Serial.begin(9600);
     co2Sensor.begin(&co2Serial);
     co2Sensor.setMeasuringRange(Mhz19MeasuringRange::Ppm_5000);
     co2Sensor.enableAutoBaseCalibration();
+    Serial.println("[Setup] Preheating CO2 sensor...");
+    while (!co2Sensor.isReady()) {
+        delay(50);
+    }
+    Serial.println("[Setup] CO2 sensor ready");
 
-    Serial.println("Preheating CO2 sensor...");
-    while (!co2Sensor.isReady()) delay(50);
-    Serial.println("CO2 sensor ready.");
-
-    // BME280
     if (!bme.begin(0x76)) {
-        Serial.println("BME280 not found!");
+        Serial.println("[Setup] BME280 not found!");
+    } else {
+        Serial.println("[Setup] BME280 initialized");
     }
 
-    // GDK101 interrupt
-    pinMode(GDK_PIN, INPUT_PULLDOWN);
-    attachInterrupt(digitalPinToInterrupt(GDK_PIN), countPulse, RISING);
+    Wire.begin();
+    Serial.println("[Setup] GDK101 I2C initialized");
 
-    // WiFi + MQTT
     connectWiFi();
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
+
+    Serial.println("[Setup] Setup complete");
 }
 
 // -------------------- LOOP ------------------------------
 void loop() {
-    if (!mqtt.connected()) connectMQTT();
+    if (!mqtt.connected()) {
+        connectMQTT();
+    }
     mqtt.loop();
 
     float pm25 = 0, pm10 = 0;
     float temperature = 0, humidity = 0, pressure = 0;
     int co2 = -1;
-    float radiation = 0;
+    int radiation = -1;
 
     // Read SDS011
     if (readSDS011(pm25, pm10)) {
+        Serial.println("[MQTT] Publishing PM values...");
         mqtt.publish(TOPIC_PM25, String(pm25).c_str(), true);
         mqtt.publish(TOPIC_PM10, String(pm10).c_str(), true);
+    } else {
+        Serial.println("[SDS011] No data read");
     }
 
     // Read CO2
-    co2 = readCO2();
-    if (co2 > 0) mqtt.publish(TOPIC_CO2, String(co2).c_str(), true);
+    co2 = co2Sensor.getCarbonDioxide();
+    if (co2 > 0) {
+        Serial.print("[CO2] ppm: "); Serial.println(co2);
+        mqtt.publish(TOPIC_CO2, String(co2).c_str(), true);
+    } else {
+        Serial.println("[CO2] Failed to read");
+    }
 
     // Read BME280
     readBME(temperature, humidity, pressure);
+    Serial.println("[MQTT] Publishing BME280 data...");
     mqtt.publish(TOPIC_TEMP,  String(temperature).c_str(), true);
     mqtt.publish(TOPIC_HUM,   String(humidity).c_str(), true);
     mqtt.publish(TOPIC_PRESS, String(pressure).c_str(), true);
 
     // Read GDK101
     radiation = readGDK101();
-    mqtt.publish(TOPIC_RAD, String(radiation).c_str(), true);
+    if (radiation >= 0) {
+        mqtt.publish(TOPIC_RAD, String(radiation).c_str(), true);
+    }
 
-    delay(5000); // 5 sec between loops
+    Serial.println("[Loop] Waiting 5 seconds before next read...\n");
+    delay(5000);
 }
