@@ -2,7 +2,7 @@
 #include <PubSubClient.h>
 #include <SoftwareSerial.h>
 #include <Adafruit_BME280.h>
-#include <Mhz19.h>
+#include <SensirionI2CScd4x.h>
 #include <Wire.h>
 
 // --------------------- USER CONFIG ------------------------
@@ -28,14 +28,11 @@ const char* TOPIC_PRESS = "home/sensors/pressure";
 #define SDS_TX 17
 SoftwareSerial sdsSerial(SDS_RX, SDS_TX);
 
-#define MHZ_RX 4
-#define MHZ_TX 5
-SoftwareSerial co2Serial(MHZ_RX, MHZ_TX);
-Mhz19 co2Sensor;
-
 Adafruit_BME280 bme;
+#define GDK101_ADDRESS 0x18
 
-#define GDK101_ADDRESS 0x18  // default I2C address
+// SCD41 CO₂ Sensor
+SensirionI2CScd4x scd4x;
 
 // -------------------- NETWORK ----------------------------
 WiFiClient espClient;
@@ -137,26 +134,36 @@ void setup() {
     Serial.begin(115200);
     Serial.println("[Setup] Starting...");
 
+    // SDS011
     sdsSerial.begin(9600);
     Serial.println("[Setup] SDS011 initialized");
 
-    co2Serial.begin(9600);
-    co2Sensor.begin(&co2Serial);
-    co2Sensor.setMeasuringRange(Mhz19MeasuringRange::Ppm_5000);
-    co2Sensor.enableAutoBaseCalibration();
-    Serial.println("[Setup] Preheating CO2 sensor...");
-    while (!co2Sensor.isReady()) {
-        delay(50);
-    }
-    Serial.println("[Setup] CO2 sensor ready");
+    // I2C (GDK101 + SCD41 + BME280)
+    Wire.begin();
 
+    // BME280
     if (!bme.begin(0x76)) {
         Serial.println("[Setup] BME280 not found!");
     } else {
         Serial.println("[Setup] BME280 initialized");
     }
 
-    Wire.begin();
+    // SCD41 initialization
+    uint16_t error;
+    char errorMessage[256];
+
+    scd4x.begin(Wire);
+    scd4x.stopPeriodicMeasurement();
+
+    error = scd4x.startPeriodicMeasurement();
+    if (error) {
+        scd4x.getErrorMessage(error, errorMessage, 256);
+        Serial.print("[SCD41] Start error: ");
+        Serial.println(errorMessage);
+    } else {
+        Serial.println("[Setup] SCD41 initialized");
+    }
+
     Serial.println("[Setup] GDK101 I2C initialized");
 
     connectWiFi();
@@ -174,28 +181,36 @@ void loop() {
 
     float pm25 = 0, pm10 = 0;
     float temperature = 0, humidity = 0, pressure = 0;
-    int co2 = -1;
     float radiation = -1.0;
 
-    // Read SDS011
+    // ---------------- SDS011 ----------------
     if (readSDS011(pm25, pm10)) {
         mqtt.publish(TOPIC_PM25, String(pm25).c_str(), true);
         mqtt.publish(TOPIC_PM10, String(pm10).c_str(), true);
     }
 
-    // Read CO2
-    co2 = co2Sensor.getCarbonDioxide();
-    if (co2 > 0) {
-        mqtt.publish(TOPIC_CO2, String(co2).c_str(), true);
+    // ---------------- SCD41 (CO₂ sensor) ----------------
+    uint16_t co2_ppm;
+    float scd_temp, scd_hum;
+    uint16_t error;
+    char errorMessage[256];
+
+    error = scd4x.readMeasurement(co2_ppm, scd_temp, scd_hum);
+
+    if (!error && co2_ppm != 0) {
+        Serial.printf("[SCD41] CO2: %u ppm, Temp: %.2f °C, Hum: %.2f %%\n",
+                      co2_ppm, scd_temp, scd_hum);
+
+        mqtt.publish(TOPIC_CO2, String(co2_ppm).c_str(), true);
     }
 
-    // Read BME280
+    // ---------------- BME280 ----------------
     readBME(temperature, humidity, pressure);
     mqtt.publish(TOPIC_TEMP,  String(temperature).c_str(), true);
     mqtt.publish(TOPIC_HUM,   String(humidity).c_str(), true);
     mqtt.publish(TOPIC_PRESS, String(pressure).c_str(), true);
 
-    // Read GDK101
+    // ---------------- GDK101 Radiation ----------------
     radiation = readGDK101();
     if (radiation >= 0) {
         mqtt.publish(TOPIC_RAD, String(radiation).c_str(), true);
